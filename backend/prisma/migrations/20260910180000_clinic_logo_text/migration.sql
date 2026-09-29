@@ -1,0 +1,1 @@
+ALTER TABLE "clinics" ALTER COLUMN "logo_url" TYPE TEXT;

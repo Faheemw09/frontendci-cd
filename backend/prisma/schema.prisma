@@ -1,0 +1,381 @@
+// Clinicy — multi-tenant clinic appointment SaaS (LOCKED MVP schema)
+// Tenant isolation: clinic_id on clinic-scoped models only.
+// Patients are a global platform identity (no clinic_id); cross-clinic history via appointments.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum Role {
+  super_admin
+  clinic_admin
+  staff
+  doctor
+  patient
+}
+
+enum ClinicStatus {
+  active
+  suspended
+  pending
+}
+
+enum ClinicPlan {
+  free
+  basic
+  pro
+}
+
+enum AppointmentStatus {
+  booked
+  completed
+  cancelled
+  no_show
+}
+
+enum TicketStatus {
+  open
+  in_progress
+  resolved
+  closed
+}
+
+enum TicketPriority {
+  low
+  medium
+  high
+  urgent
+}
+
+enum TicketCategory {
+  slot_cancelled
+  no_show_dispute
+  refund_request
+  general_complaint
+  billing
+  other
+}
+
+enum NotificationChannel {
+  in_app
+  email
+  sms
+}
+
+enum NotificationStatus {
+  pending
+  sent
+  failed
+  read
+}
+
+// ─── Tenancy root ─────────────────────────────────────────────────────────────
+
+model Clinic {
+  id        String       @id @default(uuid()) @db.Uuid
+  name      String       @db.VarChar(200)
+  slug      String       @unique @db.VarChar(100)
+  logoUrl   String?      @map("logo_url") @db.Text
+  phone     String?      @db.VarChar(20)
+  email     String?      @db.VarChar(255)
+  address   String?      @db.Text
+  city      String?      @db.VarChar(100)
+  region    String?      @db.VarChar(100)
+  status    ClinicStatus @default(pending)
+  plan      ClinicPlan   @default(basic)
+  settings  Json?        @db.JsonB
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  users              User[]
+  doctors            Doctor[]
+  doctorAvailability DoctorAvailability[]
+  doctorLeave        DoctorLeave[]
+  appointments       Appointment[]
+  supportTickets     SupportTicket[]
+  notificationsLog   NotificationLog[]
+
+  @@map("clinics")
+}
+
+// ─── Identity ─────────────────────────────────────────────────────────────────
+
+/// clinicId is NULL for platform roles: super_admin and patient.
+/// clinic_admin / staff / doctor are tenant-bound (clinicId required).
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  clinicId     String?   @map("clinic_id") @db.Uuid
+  email        String    @db.VarChar(255)
+  passwordHash String    @map("password_hash") @db.VarChar(255)
+  phone        String?   @db.VarChar(20)
+  role         Role
+  firstName    String    @map("first_name") @db.VarChar(100)
+  lastName     String    @map("last_name") @db.VarChar(100)
+  avatarUrl    String?   @map("avatar_url") @db.VarChar(500)
+  isActive     Boolean   @default(true) @map("is_active")
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  clinic Clinic? @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  doctorProfile      Doctor?
+  patientProfile     Patient?
+  appointmentsBooked Appointment[]     @relation("BookedBy")
+  ticketsCreated     SupportTicket[]   @relation("TicketRaisedBy")
+  ticketsAssigned    SupportTicket[]   @relation("TicketAssignedTo")
+  ticketMessages     TicketMessage[]
+  platformIssues     PlatformIssue[]   @relation("PlatformIssueCreatedBy")
+  notifications      NotificationLog[]
+
+  /// Clinic staff emails unique per tenant. Platform users (clinic_id NULL) need
+  /// partial unique index on email — see prisma/migrations/.../extras.sql
+  @@unique([clinicId, email], name: "users_clinic_email_unique")
+  @@index([clinicId], name: "idx_users_clinic_id")
+  @@index([role], name: "idx_users_role")
+  @@map("users")
+}
+
+// ─── Doctors ──────────────────────────────────────────────────────────────────
+
+model Doctor {
+  id                  String   @id @default(uuid()) @db.Uuid
+  clinicId            String   @map("clinic_id") @db.Uuid
+  userId              String   @unique @map("user_id") @db.Uuid
+  specialization      String   @db.VarChar(150)
+  bio                 String?  @db.Text
+  photoUrl            String?  @map("photo_url") @db.VarChar(500)
+  consultationFee     Decimal  @default(0) @map("consultation_fee") @db.Decimal(10, 2)
+  slotDurationMinutes Int      @default(30) @map("slot_duration_minutes")
+  isActive            Boolean  @default(true) @map("is_active")
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  clinic       Clinic               @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  availability DoctorAvailability[]
+  leave        DoctorLeave[]
+  appointments Appointment[]
+
+  @@index([clinicId], name: "idx_doctors_clinic_id")
+  @@index([clinicId, isActive], name: "idx_doctors_clinic_active")
+  @@map("doctors")
+}
+
+model DoctorAvailability {
+  id        String   @id @default(uuid()) @db.Uuid
+  clinicId  String   @map("clinic_id") @db.Uuid
+  doctorId  String   @map("doctor_id") @db.Uuid
+  /// 0 = Sunday … 6 = Saturday
+  dayOfWeek Int      @map("day_of_week") @db.SmallInt
+  startTime String   @map("start_time") @db.VarChar(5)
+  endTime   String   @map("end_time") @db.VarChar(5)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([doctorId, dayOfWeek, startTime], name: "doctor_availability_unique_window")
+  @@index([clinicId], name: "idx_doctor_availability_clinic_id")
+  @@index([doctorId], name: "idx_doctor_availability_doctor_id")
+  @@map("doctor_availability")
+}
+
+model DoctorLeave {
+  id        String   @id @default(uuid()) @db.Uuid
+  clinicId  String   @map("clinic_id") @db.Uuid
+  doctorId  String   @map("doctor_id") @db.Uuid
+  startDate DateTime @map("start_date") @db.Date
+  endDate   DateTime @map("end_date") @db.Date
+  reason    String?  @db.VarChar(500)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  doctor Doctor @relation(fields: [doctorId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([clinicId], name: "idx_doctor_leave_clinic_id")
+  @@index([doctorId, startDate, endDate], name: "idx_doctor_leave_range")
+  @@map("doctor_leave")
+}
+
+// ─── Patients (global platform identity) ──────────────────────────────────────
+
+/// No clinic_id — one Patient per User (role=patient). Cross-clinic history via appointments.
+model Patient {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @unique @map("user_id") @db.Uuid
+  fullName     String    @map("full_name") @db.VarChar(200)
+  phone        String    @db.VarChar(20)
+  email        String?   @db.VarChar(255)
+  dateOfBirth  DateTime? @map("date_of_birth") @db.Date
+  gender       String?   @db.VarChar(20)
+  address      String?   @db.Text
+  medicalNotes String?   @map("medical_notes") @db.Text
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user         User            @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  appointments Appointment[]
+  tickets      SupportTicket[]
+
+  @@index([phone], name: "idx_patients_phone")
+  @@index([email], name: "idx_patients_email")
+  @@map("patients")
+}
+
+// ─── Appointments ─────────────────────────────────────────────────────────────
+
+/// Double-booking prevented by partial unique index on (doctor_id, slot_time)
+/// WHERE status != 'cancelled' — see migration + extras.sql (not expressible in Prisma @@unique).
+model Appointment {
+  id                 String            @id @default(uuid()) @db.Uuid
+  clinicId           String            @map("clinic_id") @db.Uuid
+  doctorId           String            @map("doctor_id") @db.Uuid
+  patientId          String            @map("patient_id") @db.Uuid
+  bookedByUserId     String?           @map("booked_by_user_id") @db.Uuid
+  appointmentDate    DateTime          @map("appointment_date") @db.Date
+  startTime          String            @map("start_time") @db.VarChar(5)
+  endTime            String            @map("end_time") @db.VarChar(5)
+  /// Absolute slot start (date + startTime); used by partial unique index with doctor_id
+  slotTime           DateTime          @map("slot_time") @db.Timestamptz(6)
+  status             AppointmentStatus @default(booked)
+  notes              String?           @db.Text
+  cancellationReason String?           @map("cancellation_reason") @db.VarChar(500)
+  /// Who initiated cancel: patient | clinic_admin | staff | doctor | system
+  cancelledByRole    String?           @map("cancelled_by_role") @db.VarChar(30)
+  cancelledAt        DateTime?         @map("cancelled_at") @db.Timestamptz(6)
+  createdAt          DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  clinic   Clinic  @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  doctor   Doctor  @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  patient  Patient @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  bookedBy User?   @relation("BookedBy", fields: [bookedByUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  supportTickets SupportTicket[]
+
+  @@index([clinicId], name: "idx_appointments_clinic_id")
+  @@index([clinicId, appointmentDate], name: "idx_appointments_clinic_date")
+  @@index([doctorId, appointmentDate], name: "idx_appointments_doctor_date")
+  @@index([doctorId, slotTime], name: "idx_appointments_doctor_slot_time")
+  @@index([patientId], name: "idx_appointments_patient_id")
+  @@index([status], name: "idx_appointments_status")
+  @@map("appointments")
+}
+
+// ─── Support tickets + threaded replies ───────────────────────────────────────
+
+model SupportTicket {
+  id                  String         @id @default(uuid()) @db.Uuid
+  clinicId            String         @map("clinic_id") @db.Uuid
+  patientId           String?        @map("patient_id") @db.Uuid
+  linkedAppointmentId String?        @map("linked_appointment_id") @db.Uuid
+  raisedBy            String         @map("raised_by") @db.Uuid
+  assignedTo          String?        @map("assigned_to") @db.Uuid
+  subject             String         @db.VarChar(255)
+  description         String         @db.Text
+  category            TicketCategory @default(general_complaint)
+  status              TicketStatus   @default(open)
+  priority            TicketPriority @default(medium)
+  resolvedAt          DateTime?      @map("resolved_at") @db.Timestamptz(6)
+  createdAt           DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  clinic            Clinic           @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  patient           Patient?         @relation(fields: [patientId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  linkedAppointment Appointment?     @relation(fields: [linkedAppointmentId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  raisedByUser      User             @relation("TicketRaisedBy", fields: [raisedBy], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignedToUser    User?            @relation("TicketAssignedTo", fields: [assignedTo], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  messages          TicketMessage[]
+
+  @@index([clinicId], name: "idx_support_tickets_clinic_id")
+  @@index([clinicId, status], name: "idx_support_tickets_clinic_status")
+  @@index([assignedTo], name: "idx_support_tickets_assignee")
+  @@index([patientId], name: "idx_support_tickets_patient_id")
+  @@index([linkedAppointmentId], name: "idx_support_tickets_appointment_id")
+  @@index([status, createdAt], name: "idx_support_tickets_status_created")
+  @@index([category], name: "idx_support_tickets_category")
+  @@map("support_tickets")
+}
+
+model TicketMessage {
+  id        String   @id @default(uuid()) @db.Uuid
+  ticketId  String   @map("ticket_id") @db.Uuid
+  authorId  String   @map("author_id") @db.Uuid
+  body      String   @db.Text
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  author User          @relation(fields: [authorId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([ticketId, createdAt], name: "idx_ticket_messages_ticket_created")
+  @@map("ticket_messages")
+}
+
+// ─── Notifications audit / delivery log ───────────────────────────────────────
+
+model NotificationLog {
+  id        String              @id @default(uuid()) @db.Uuid
+  clinicId  String?             @map("clinic_id") @db.Uuid
+  userId    String              @map("user_id") @db.Uuid
+  type      String              @db.VarChar(100)
+  channel   NotificationChannel @default(in_app)
+  title     String              @db.VarChar(255)
+  body      String              @db.Text
+  payload   Json?               @db.JsonB
+  status    NotificationStatus  @default(pending)
+  sentAt    DateTime?           @map("sent_at") @db.Timestamptz(6)
+  createdAt DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  clinic Clinic? @relation(fields: [clinicId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([clinicId], name: "idx_notifications_log_clinic_id")
+  @@index([userId, status], name: "idx_notifications_log_user_status")
+  @@index([createdAt], name: "idx_notifications_log_created_at")
+  @@map("notifications_log")
+}
+
+// ─── Platform-level issue log (non-clinic-specific) ───────────────────────────
+
+enum PlatformIssueStatus {
+  open
+  investigating
+  resolved
+  closed
+}
+
+enum PlatformIssueSeverity {
+  low
+  medium
+  high
+  critical
+}
+
+model PlatformIssue {
+  id          String                @id @default(uuid()) @db.Uuid
+  title       String                @db.VarChar(255)
+  description String                @db.Text
+  category    String                @default("general") @db.VarChar(100)
+  severity    PlatformIssueSeverity @default(medium)
+  status      PlatformIssueStatus   @default(open)
+  createdById String                @map("created_by") @db.Uuid
+  resolvedAt  DateTime?             @map("resolved_at") @db.Timestamptz(6)
+  createdAt   DateTime              @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime              @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  createdBy User @relation("PlatformIssueCreatedBy", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([status, createdAt], name: "idx_platform_issues_status_created")
+  @@index([severity], name: "idx_platform_issues_severity")
+  @@map("platform_issues")
+}
